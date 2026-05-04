@@ -15,6 +15,7 @@ MIN_STRONG_EDGE = float(os.getenv("MIN_STRONG_EDGE", "0.085"))
 MIN_ODDS = float(os.getenv("MIN_ODDS", "1.65"))
 MAX_ODDS = float(os.getenv("MAX_ODDS", "2.75"))
 MIN_SAMPLE_SIZE = int(os.getenv("MIN_SAMPLE_SIZE", "10"))
+MIN_CONFIDENCE_MULTIPLIER = float(os.getenv("MIN_CONFIDENCE_MULTIPLIER", "0.25"))
 
 
 def db():
@@ -157,6 +158,27 @@ def calculate_kelly_stake(decimal_odds, model_probability, bankroll, max_stake_p
     return round(stake_pct, 4), round(bankroll * stake_pct, 2)
 
 
+def confidence_stake_multiplier(confidence_score):
+    """
+    Converts confidence score into stake multiplier.
+    Confidence does NOT create new bets; it only scales down/up the Kelly stake.
+    50 confidence = minimum multiplier.
+    100 confidence = 1.00x Kelly stake.
+    """
+    score = max(1, min(100, int(confidence_score)))
+    if score < 50:
+        return 0.0
+    multiplier = MIN_CONFIDENCE_MULTIPLIER + ((score - 50) / 50) * (1 - MIN_CONFIDENCE_MULTIPLIER)
+    return round(max(MIN_CONFIDENCE_MULTIPLIER, min(1.0, multiplier)), 3)
+
+
+def apply_confidence_to_stake(base_stake_pct, bankroll, confidence_score):
+    multiplier = confidence_stake_multiplier(confidence_score)
+    stake_pct = round(base_stake_pct * multiplier, 4)
+    stake_amount = round(bankroll * stake_pct, 2)
+    return stake_pct, stake_amount, multiplier
+
+
 def odds_bucket(odds):
     odds = float(odds)
     if odds < 1.8:
@@ -167,18 +189,7 @@ def odds_bucket(odds):
 
 
 def calculate_confidence_score(signal_level, edge, odds, model_probability, fair_probability, home_signal_adj, away_signal_adj, odds_adj, signal_adj):
-    """
-    Confidence score 1-100.
-    This is NOT a guarantee. It is a decision-support score that combines:
-    - edge strength
-    - signal level
-    - odds quality
-    - model vs market gap
-    - OpenClaw signal clarity
-    - auto-learning penalties
-    """
     score = 50
-
     score += min(max((edge - MIN_EDGE) * 450, 0), 22)
     score += min(max((model_probability - fair_probability) * 220, 0), 18)
 
@@ -426,7 +437,7 @@ def run_predictions():
 
             if signal_level != "PASS":
                 rec = f"{signal_level}: {selected_team} moneyline"
-                stake_pct, stake_amount = calculate_kelly_stake(selected_odds, model_team_prob, bankroll, max_stake_pct, kelly_fraction)
+                base_stake_pct, base_stake_amount = calculate_kelly_stake(selected_odds, model_team_prob, bankroll, max_stake_pct, kelly_fraction)
                 confidence_score = calculate_confidence_score(
                     signal_level,
                     alert_edge,
@@ -438,10 +449,18 @@ def run_predictions():
                     odds_adj,
                     signal_adj,
                 )
+                stake_pct, stake_amount, confidence_multiplier = apply_confidence_to_stake(base_stake_pct, bankroll, confidence_score)
+
                 learn_note = ""
                 if odds_adj["reason"] or signal_adj["reason"]:
                     learn_note = f" Auto-learning: {odds_adj['reason']} {signal_adj['reason']}"
-                reason = f"{reason} Confidence {confidence_score}/100. Model {round(model_team_prob*100,1)}% vs market {round(fair_team_prob*100,1)}%. Adjusted edge {round(alert_edge*100,1)}%. Odds bucket {bucket}.{learn_note}"
+                reason = (
+                    f"{reason} Confidence {confidence_score}/100. "
+                    f"Confidence stake multiplier {confidence_multiplier}x. "
+                    f"Base Kelly stake ${base_stake_amount}, adjusted stake ${stake_amount}. "
+                    f"Model {round(model_team_prob*100,1)}% vs market {round(fair_team_prob*100,1)}%. "
+                    f"Adjusted edge {round(alert_edge*100,1)}%. Odds bucket {bucket}.{learn_note}"
+                )
                 save_bet_recommendation(cur, game_id, selected_team, rec, float(selected_odds), model_team_prob, fair_team_prob, alert_edge, confidence_score, bankroll, stake_pct, stake_amount, signal_level, risk_level, reason)
 
                 if stake_amount > 0 and not already_alerted(cur, game_id, rec):
@@ -452,12 +471,14 @@ def run_predictions():
 Pick: <b>{selected_team} moneyline</b>
 Odds: <b>{selected_odds}</b>
 Confidence: <b>{confidence_score}/100</b>
+Stake multiplier: <b>{confidence_multiplier}x</b>
 Risk: <b>{risk_level}</b>
 
 Model after learning: <b>{round(model_team_prob * 100, 1)}%</b>
 Market: <b>{round(fair_team_prob * 100, 1)}%</b>
 Adjusted edge: <b>{round(alert_edge * 100, 1)}%</b>
-Suggested stake: <b>${stake_amount}</b> ({round(stake_pct * 100, 2)}%)
+Base Kelly stake: <b>${base_stake_amount}</b>
+Suggested stake after confidence: <b>${stake_amount}</b> ({round(stake_pct * 100, 2)}%)
 
 Reason: {reason}
 
