@@ -19,10 +19,20 @@ def db():
 def ensure_tables(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS games (
-            id SERIAL PRIMARY KEY, home_team TEXT, away_team TEXT, game_time TIMESTAMP,
-            home_odds NUMERIC, away_odds NUMERIC, status TEXT DEFAULT 'scheduled',
-            home_score INT, away_score INT, source TEXT DEFAULT 'openclaw',
-            created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+            id SERIAL PRIMARY KEY,
+            home_team TEXT,
+            away_team TEXT,
+            game_time TIMESTAMP,
+            home_odds NUMERIC,
+            away_odds NUMERIC,
+            status TEXT DEFAULT 'scheduled',
+            home_score INT,
+            away_score INT,
+            source TEXT DEFAULT 'openclaw',
+            is_anomaly BOOLEAN DEFAULT false,
+            anomaly_reason TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
         )
     """)
     for q in [
@@ -30,33 +40,71 @@ def ensure_tables(cur):
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS home_score INT",
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS away_score INT",
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'openclaw'",
+        "ALTER TABLE games ADD COLUMN IF NOT EXISTS is_anomaly BOOLEAN DEFAULT false",
+        "ALTER TABLE games ADD COLUMN IF NOT EXISTS anomaly_reason TEXT",
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
     ]:
         cur.execute(q)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS data_anomalies (
+            id SERIAL PRIMARY KEY,
+            anomaly_type TEXT,
+            source TEXT,
+            home_team TEXT,
+            away_team TEXT,
+            payload TEXT,
+            reason TEXT,
+            severity TEXT DEFAULT 'medium',
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
-            id SERIAL PRIMARY KEY, game_id INT, win_prob_home NUMERIC,
-            win_prob_away NUMERIC, edge_home NUMERIC, recommendation TEXT,
+            id SERIAL PRIMARY KEY,
+            game_id INT,
+            win_prob_home NUMERIC,
+            win_prob_away NUMERIC,
+            edge_home NUMERIC,
+            recommendation TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS news_signals (
-            id SERIAL PRIMARY KEY, league TEXT DEFAULT 'NBA', team TEXT, player TEXT,
-            signal_type TEXT, signal_text TEXT, impact_score NUMERIC,
-            source TEXT DEFAULT 'openclaw', created_at TIMESTAMP DEFAULT NOW()
+            id SERIAL PRIMARY KEY,
+            league TEXT DEFAULT 'NBA',
+            team TEXT,
+            player TEXT,
+            signal_type TEXT,
+            signal_text TEXT,
+            impact_score NUMERIC,
+            source TEXT DEFAULT 'openclaw',
+            created_at TIMESTAMP DEFAULT NOW()
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bet_recommendations (
-            id SERIAL PRIMARY KEY, game_id INT, selected_team TEXT, recommendation TEXT,
-            selected_odds NUMERIC, model_probability NUMERIC, fair_probability NUMERIC,
-            edge NUMERIC, bankroll NUMERIC, stake_pct NUMERIC, stake_amount NUMERIC,
-            signal_level TEXT DEFAULT 'PASS', risk_level TEXT DEFAULT 'HIGH', reason TEXT,
-            status TEXT DEFAULT 'open', result_profit NUMERIC DEFAULT 0,
-            created_at TIMESTAMP DEFAULT NOW(), settled_at TIMESTAMP,
+            id SERIAL PRIMARY KEY,
+            game_id INT,
+            selected_team TEXT,
+            recommendation TEXT,
+            selected_odds NUMERIC,
+            model_probability NUMERIC,
+            fair_probability NUMERIC,
+            edge NUMERIC,
+            bankroll NUMERIC,
+            stake_pct NUMERIC,
+            stake_amount NUMERIC,
+            signal_level TEXT DEFAULT 'PASS',
+            risk_level TEXT DEFAULT 'HIGH',
+            reason TEXT,
+            status TEXT DEFAULT 'open',
+            result_profit NUMERIC DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW(),
+            settled_at TIMESTAMP,
             UNIQUE (game_id, recommendation)
         )
     """)
@@ -70,10 +118,17 @@ def ensure_tables(cur):
         cur.execute(q)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS model_adjustments (
-            id SERIAL PRIMARY KEY, bucket_type TEXT NOT NULL, bucket_name TEXT NOT NULL,
-            sample_size INT DEFAULT 0, accuracy NUMERIC DEFAULT 0, roi NUMERIC DEFAULT 0,
-            probability_penalty NUMERIC DEFAULT 0, edge_penalty NUMERIC DEFAULT 0,
-            reason TEXT, updated_at TIMESTAMP DEFAULT NOW(), UNIQUE(bucket_type, bucket_name)
+            id SERIAL PRIMARY KEY,
+            bucket_type TEXT NOT NULL,
+            bucket_name TEXT NOT NULL,
+            sample_size INT DEFAULT 0,
+            accuracy NUMERIC DEFAULT 0,
+            roi NUMERIC DEFAULT 0,
+            probability_penalty NUMERIC DEFAULT 0,
+            edge_penalty NUMERIC DEFAULT 0,
+            reason TEXT,
+            updated_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(bucket_type, bucket_name)
         )
     """)
 
@@ -89,6 +144,47 @@ def exec_sql(sql, params=None):
     cur.execute(sql, params or ())
     out = cur.fetchone() if cur.description else None
     conn.commit(); cur.close(); conn.close(); return out
+
+
+def log_anomaly(cur, anomaly_type, source, home_team, away_team, payload, reason, severity="medium"):
+    cur.execute("""
+        INSERT INTO data_anomalies (anomaly_type, source, home_team, away_team, payload, reason, severity)
+        VALUES (%s,%s,%s,%s,%s,%s,%s)
+    """, (anomaly_type, source, home_team, away_team, str(payload), reason, severity))
+
+
+def validate_odds(home_odds, away_odds):
+    reasons = []
+    if home_odds is None or away_odds is None:
+        reasons.append("missing odds")
+        return reasons
+    try:
+        h = float(home_odds); a = float(away_odds)
+    except Exception:
+        return ["odds not numeric"]
+    if h < 1.01 or a < 1.01:
+        reasons.append("decimal odds below 1.01")
+    if h > 15 or a > 15:
+        reasons.append("decimal odds above 15: likely parsing error")
+    if h == a and h in [100, 110, 120, 150, 200]:
+        reasons.append("looks like American odds were not converted")
+    implied_sum = (1 / h) + (1 / a) if h > 1 and a > 1 else 0
+    if implied_sum < 0.75 or implied_sum > 1.35:
+        reasons.append(f"unrealistic implied probability sum: {round(implied_sum, 3)}")
+    return reasons
+
+
+def validate_score(home_score, away_score):
+    reasons = []
+    if home_score is None or away_score is None:
+        return ["missing score"]
+    if home_score < 40 or away_score < 40:
+        reasons.append("score too low for NBA final")
+    if home_score > 180 or away_score > 180:
+        reasons.append("score too high for NBA final")
+    if abs(home_score - away_score) > 80:
+        reasons.append("unrealistic score difference")
+    return reasons
 
 
 class NewsSignal(BaseModel):
@@ -130,7 +226,7 @@ class BetResult(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message":"Basketball Betting Analytics API", "dashboard":"/dashboard", "learning":"/model-learning"}
+    return {"message":"Basketball Betting Analytics API", "dashboard":"/dashboard", "anomalies":"/anomalies", "learning":"/model-learning"}
 
 @app.get("/health")
 def health():
@@ -142,41 +238,69 @@ def dashboard():
     return """
 <!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'><title>Basketball Analytics</title>
 <style>body{margin:0;font-family:Arial;background:#0f172a;color:#e5e7eb}header{padding:24px;background:#111827;border-bottom:1px solid #334155}.wrap{padding:24px;max-width:1300px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin:20px 0}.card{background:#111827;border:1px solid #334155;border-radius:16px;padding:16px}.label{color:#94a3b8;font-size:13px}.metric{font-size:28px;font-weight:700;margin-top:6px}.pos{color:#22c55e}.neg{color:#f87171}.no{color:#94a3b8}.bet{color:#22c55e;font-weight:700}.strong{color:#22c55e;font-weight:800}.medium{color:#facc15;font-weight:800}.bar{height:10px;background:#334155;border-radius:20px;overflow:hidden}.bar span{display:block;height:10px;background:#22c55e}table{width:100%;border-collapse:collapse;background:#111827;border:1px solid #334155;border-radius:14px;overflow:hidden;margin-bottom:26px}th,td{padding:10px;border-bottom:1px solid #1f2937;text-align:left;font-size:14px}th{background:#1f2937;color:#cbd5e1}.btn{padding:9px 12px;border-radius:10px;border:1px solid #475569;background:#1d4ed8;color:white;cursor:pointer}.mini{font-size:12px;color:#94a3b8}@media(max-width:700px){table{display:block;overflow-x:auto;white-space:nowrap}}</style></head>
-<body><header><h1>🏀 Basketball Betting Analytics</h1><div>Top 3 daily signals • Accuracy audit • Model learning</div></header><div class='wrap'><button class='btn' onclick='loadData()'>Refresh</button><div class='mini' id='updated'>Loading...</div>
-<div class='grid'><div class='card'><div class='label'>Games</div><div class='metric' id='gamesCount'>0</div></div><div class='card'><div class='label'>Top Bets Today</div><div class='metric' id='topCount'>0</div></div><div class='card'><div class='label'>Accuracy</div><div class='metric' id='accuracy'>0%</div></div><div class='card'><div class='label'>Correct / Graded</div><div class='metric' id='correctCount'>0/0</div></div><div class='card'><div class='label'>Profit</div><div class='metric' id='profit'>$0</div></div><div class='card'><div class='label'>ROI</div><div class='metric' id='roi'>0%</div></div></div>
+<body><header><h1>🏀 Basketball Betting Analytics</h1><div>Top 3 daily signals • Accuracy audit • Model learning • Anomaly detection</div></header><div class='wrap'><button class='btn' onclick='loadData()'>Refresh</button><div class='mini' id='updated'>Loading...</div>
+<div class='grid'><div class='card'><div class='label'>Games</div><div class='metric' id='gamesCount'>0</div></div><div class='card'><div class='label'>Top Bets Today</div><div class='metric' id='topCount'>0</div></div><div class='card'><div class='label'>Accuracy</div><div class='metric' id='accuracy'>0%</div></div><div class='card'><div class='label'>Anomalies</div><div class='metric neg' id='anomalyCount'>0</div></div><div class='card'><div class='label'>Profit</div><div class='metric' id='profit'>$0</div></div><div class='card'><div class='label'>ROI</div><div class='metric' id='roi'>0%</div></div></div>
 <h2>🏆 Top 3 Bets Today</h2><table><thead><tr><th>Rank</th><th>Game</th><th>Signal</th><th>Pick</th><th>Odds</th><th>Edge</th><th>Stake</th><th>Reason</th></tr></thead><tbody id='topBetsTable'></tbody></table>
+<h2>🚨 Data Anomalies</h2><table><thead><tr><th>Type</th><th>Game</th><th>Reason</th><th>Severity</th><th>Source</th><th>Time</th></tr></thead><tbody id='anomalyTable'></tbody></table>
 <h2>🧬 Model Learning / Auto Adjustments</h2><table><thead><tr><th>Bucket</th><th>Sample</th><th>Accuracy</th><th>ROI</th><th>Probability Penalty</th><th>Edge Penalty</th><th>Visual</th><th>Reason</th></tr></thead><tbody id='learningTable'></tbody></table>
 <h2>✅ Accuracy Audit</h2><table><thead><tr><th>ID</th><th>Game</th><th>Pick</th><th>Score</th><th>Actual Winner</th><th>Matched?</th><th>Signal</th><th>Edge</th></tr></thead><tbody id='auditTable'></tbody></table>
 <h2>💰 Bet Tracking</h2><table><thead><tr><th>ID</th><th>Game</th><th>Pick</th><th>Odds</th><th>Edge</th><th>Stake</th><th>Status</th><th>Profit</th><th>Actions</th></tr></thead><tbody id='betsTable'></tbody></table>
 </div><script>
 function pct(x){return x==null?'-':(x*100).toFixed(1)+'%'}function money(x){return '$'+Number(x||0).toFixed(2)}function edge(x){return x==null?'-':(x*100).toFixed(1)+'%'}function cls(x){return Number(x)>=0?'pos':'neg'}async function j(p){const r=await fetch(p);if(!r.ok)throw new Error(p);return r.json()}async function settle(id,status){await fetch('/bets/'+id+'/result',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})});loadData()}
-async function loadData(){try{const [games,top,bets,perf,acc,audit,learning]=await Promise.all([j('/games'),j('/top-bets'),j('/bets'),j('/performance'),j('/accuracy'),j('/audit'),j('/model-learning')]);document.getElementById('gamesCount').textContent=games.length;document.getElementById('topCount').textContent=top.length;document.getElementById('profit').textContent=money(perf.profit);document.getElementById('profit').className='metric '+cls(perf.profit);document.getElementById('roi').textContent=Number(perf.roi||0).toFixed(1)+'%';document.getElementById('roi').className='metric '+cls(perf.roi);document.getElementById('accuracy').textContent=Number(acc.accuracy_pct||0).toFixed(1)+'%';document.getElementById('accuracy').className='metric '+cls(acc.accuracy_pct);document.getElementById('correctCount').textContent=`${acc.correct}/${acc.graded}`;document.getElementById('updated').textContent='Updated: '+new Date().toLocaleString();document.getElementById('topBetsTable').innerHTML=top.length?top.map((b,i)=>`<tr><td>#${i+1}</td><td>${b.away_team||'-'} @ ${b.home_team||'-'}</td><td class='${b.signal_level==='STRONG BET'?'strong':'medium'}'>${b.signal_level}</td><td>${b.recommendation}</td><td>${b.selected_odds}</td><td class='${cls(b.edge)}'>${edge(b.edge)}</td><td>${money(b.stake_amount)}</td><td>${b.reason||''}</td></tr>`).join(''):'<tr><td colspan=8 class=no>No top bets today</td></tr>';document.getElementById('learningTable').innerHTML=learning.length?learning.map(l=>`<tr><td>${l.bucket_type}: ${l.bucket_name}</td><td>${l.sample_size}</td><td class='${cls(l.accuracy-0.5)}'>${pct(l.accuracy)}</td><td class='${cls(l.roi)}'>${pct(l.roi)}</td><td>${pct(l.probability_penalty)}</td><td>${pct(l.edge_penalty)}</td><td><div class='bar'><span style='width:${Math.max(0,Math.min(100,l.accuracy*100))}%'></span></div></td><td>${l.reason||''}</td></tr>`).join(''):'<tr><td colspan=8 class=no>No learning data yet. Need graded results.</td></tr>';document.getElementById('auditTable').innerHTML=audit.length?audit.map(a=>`<tr><td>${a.bet_id}</td><td>${a.away_team||'-'} @ ${a.home_team||'-'}</td><td>${a.selected_team}</td><td>${a.away_score??'-'} - ${a.home_score??'-'}</td><td>${a.actual_winner||'-'}</td><td class='${a.is_correct?'pos':'neg'}'>${a.is_correct===null?'Pending':(a.is_correct?'YES':'NO')}</td><td>${a.signal_level||'-'}</td><td>${edge(a.edge)}</td></tr>`).join(''):'<tr><td colspan=8 class=no>No graded picks yet</td></tr>';document.getElementById('betsTable').innerHTML=bets.length?bets.map(b=>`<tr><td>${b.id}</td><td>${b.away_team||'-'} @ ${b.home_team||'-'}</td><td class='bet'>${b.recommendation}</td><td>${b.selected_odds}</td><td class='${cls(b.edge)}'>${edge(b.edge)}</td><td>${money(b.stake_amount)}</td><td>${b.status}</td><td class='${cls(b.result_profit)}'>${money(b.result_profit)}</td><td><button onclick="settle(${b.id},'won')">Won</button> <button onclick="settle(${b.id},'lost')">Lost</button> <button onclick="settle(${b.id},'push')">Push</button></td></tr>`).join(''):'<tr><td colspan=9 class=no>No tracked bets yet</td></tr>'}catch(e){document.getElementById('updated').textContent='Error: '+e.message}}loadData();setInterval(loadData,30000);
+async function loadData(){try{const [games,top,bets,perf,acc,audit,learning,anoms]=await Promise.all([j('/games'),j('/top-bets'),j('/bets'),j('/performance'),j('/accuracy'),j('/audit'),j('/model-learning'),j('/anomalies')]);document.getElementById('gamesCount').textContent=games.length;document.getElementById('topCount').textContent=top.length;document.getElementById('anomalyCount').textContent=anoms.length;document.getElementById('profit').textContent=money(perf.profit);document.getElementById('profit').className='metric '+cls(perf.profit);document.getElementById('roi').textContent=Number(perf.roi||0).toFixed(1)+'%';document.getElementById('roi').className='metric '+cls(perf.roi);document.getElementById('accuracy').textContent=Number(acc.accuracy_pct||0).toFixed(1)+'%';document.getElementById('accuracy').className='metric '+cls(acc.accuracy_pct);document.getElementById('updated').textContent='Updated: '+new Date().toLocaleString();document.getElementById('topBetsTable').innerHTML=top.length?top.map((b,i)=>`<tr><td>#${i+1}</td><td>${b.away_team||'-'} @ ${b.home_team||'-'}</td><td class='${b.signal_level==='STRONG BET'?'strong':'medium'}'>${b.signal_level}</td><td>${b.recommendation}</td><td>${b.selected_odds}</td><td class='${cls(b.edge)}'>${edge(b.edge)}</td><td>${money(b.stake_amount)}</td><td>${b.reason||''}</td></tr>`).join(''):'<tr><td colspan=8 class=no>No top bets today</td></tr>';document.getElementById('anomalyTable').innerHTML=anoms.length?anoms.map(a=>`<tr><td>${a.anomaly_type}</td><td>${a.away_team||'-'} @ ${a.home_team||'-'}</td><td>${a.reason}</td><td class='neg'>${a.severity}</td><td>${a.source}</td><td>${a.created_at}</td></tr>`).join(''):'<tr><td colspan=6 class=no>No anomalies detected</td></tr>';document.getElementById('learningTable').innerHTML=learning.length?learning.map(l=>`<tr><td>${l.bucket_type}: ${l.bucket_name}</td><td>${l.sample_size}</td><td class='${cls(l.accuracy-0.5)}'>${pct(l.accuracy)}</td><td class='${cls(l.roi)}'>${pct(l.roi)}</td><td>${pct(l.probability_penalty)}</td><td>${pct(l.edge_penalty)}</td><td><div class='bar'><span style='width:${Math.max(0,Math.min(100,l.accuracy*100))}%'></span></div></td><td>${l.reason||''}</td></tr>`).join(''):'<tr><td colspan=8 class=no>No learning data yet. Need graded results.</td></tr>';document.getElementById('auditTable').innerHTML=audit.length?audit.map(a=>`<tr><td>${a.bet_id}</td><td>${a.away_team||'-'} @ ${a.home_team||'-'}</td><td>${a.selected_team}</td><td>${a.away_score??'-'} - ${a.home_score??'-'}</td><td>${a.actual_winner||'-'}</td><td class='${a.is_correct?'pos':'neg'}'>${a.is_correct===null?'Pending':(a.is_correct?'YES':'NO')}</td><td>${a.signal_level||'-'}</td><td>${edge(a.edge)}</td></tr>`).join(''):'<tr><td colspan=8 class=no>No graded picks yet</td></tr>';document.getElementById('betsTable').innerHTML=bets.length?bets.map(b=>`<tr><td>${b.id}</td><td>${b.away_team||'-'} @ ${b.home_team||'-'}</td><td class='bet'>${b.recommendation}</td><td>${b.selected_odds}</td><td class='${cls(b.edge)}'>${edge(b.edge)}</td><td>${money(b.stake_amount)}</td><td>${b.status}</td><td class='${cls(b.result_profit)}'>${money(b.result_profit)}</td><td><button onclick="settle(${b.id},'won')">Won</button> <button onclick="settle(${b.id},'lost')">Lost</button> <button onclick="settle(${b.id},'push')">Push</button></td></tr>`).join(''):'<tr><td colspan=9 class=no>No tracked bets yet</td></tr>'}catch(e){document.getElementById('updated').textContent='Error: '+e.message}}loadData();setInterval(loadData,30000);
 </script></body></html>
     """
 
 @app.post("/games/import")
 def import_games(payload: GamesImportPayload):
-    conn=db(); cur=conn.cursor(); ensure_tables(cur); saved=0
+    conn=db(); cur=conn.cursor(); ensure_tables(cur); saved=0; rejected=0
     for g in payload.games:
+        anomaly_reasons = validate_odds(g.home_odds, g.away_odds)
+        is_anomaly = len(anomaly_reasons) > 0
+        reason = "; ".join(anomaly_reasons)
+        if is_anomaly:
+            log_anomaly(cur, "odds_import", g.source, g.home_team, g.away_team, g.model_dump(), reason, "high")
+            rejected += 1
         cur.execute("SELECT id FROM games WHERE LOWER(home_team)=LOWER(%s) AND LOWER(away_team)=LOWER(%s) AND COALESCE(DATE(game_time),CURRENT_DATE)=COALESCE(DATE(%s::timestamp),CURRENT_DATE) LIMIT 1",(g.home_team,g.away_team,g.game_time)); row=cur.fetchone()
-        if row: cur.execute("UPDATE games SET game_time=COALESCE(%s,game_time),home_odds=COALESCE(%s,home_odds),away_odds=COALESCE(%s,away_odds),status=COALESCE(%s,status),source=%s,updated_at=NOW() WHERE id=%s",(g.game_time,g.home_odds,g.away_odds,g.status,g.source,row[0]))
-        else: cur.execute("INSERT INTO games (home_team,away_team,game_time,home_odds,away_odds,status,source) VALUES (%s,%s,%s,%s,%s,%s,%s)",(g.home_team,g.away_team,g.game_time,g.home_odds,g.away_odds,g.status,g.source))
+        home_odds = None if is_anomaly else g.home_odds
+        away_odds = None if is_anomaly else g.away_odds
+        status = "anomaly" if is_anomaly else g.status
+        if row:
+            cur.execute("UPDATE games SET game_time=COALESCE(%s,game_time),home_odds=COALESCE(%s,home_odds),away_odds=COALESCE(%s,away_odds),status=%s,source=%s,is_anomaly=%s,anomaly_reason=%s,updated_at=NOW() WHERE id=%s",(g.game_time,home_odds,away_odds,status,g.source,is_anomaly,reason,row[0]))
+        else:
+            cur.execute("INSERT INTO games (home_team,away_team,game_time,home_odds,away_odds,status,source,is_anomaly,anomaly_reason) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",(g.home_team,g.away_team,g.game_time,home_odds,away_odds,status,g.source,is_anomaly,reason))
         saved+=1
-    conn.commit(); cur.close(); conn.close(); return {"status":"ok","saved":saved}
+    conn.commit(); cur.close(); conn.close(); return {"status":"ok","saved":saved,"rejected_as_anomaly":rejected}
 
 @app.post("/results/import")
 def import_results(payload: ResultsImportPayload):
-    conn=db(); cur=conn.cursor(); ensure_tables(cur); saved=0
+    conn=db(); cur=conn.cursor(); ensure_tables(cur); saved=0; rejected=0
     for r in payload.results:
+        anomaly_reasons = validate_score(r.home_score, r.away_score)
+        is_anomaly = len(anomaly_reasons) > 0
+        reason = "; ".join(anomaly_reasons)
+        if is_anomaly:
+            log_anomaly(cur, "score_import", r.source, r.home_team, r.away_team, r.model_dump(), reason, "high")
+            rejected += 1
+            continue
         cur.execute("SELECT id FROM games WHERE LOWER(home_team)=LOWER(%s) AND LOWER(away_team)=LOWER(%s) ORDER BY id DESC LIMIT 1",(r.home_team,r.away_team)); row=cur.fetchone()
-        if row: cur.execute("UPDATE games SET home_score=%s,away_score=%s,status=%s,source=%s,updated_at=NOW() WHERE id=%s",(r.home_score,r.away_score,r.status,r.source,row[0]))
-        else: cur.execute("INSERT INTO games (home_team,away_team,game_time,home_score,away_score,status,source) VALUES (%s,%s,%s,%s,%s,%s,%s)",(r.home_team,r.away_team,r.game_time,r.home_score,r.away_score,r.status,r.source))
+        if row: cur.execute("UPDATE games SET home_score=%s,away_score=%s,status=%s,source=%s,is_anomaly=false,updated_at=NOW() WHERE id=%s",(r.home_score,r.away_score,r.status,r.source,row[0]))
+        else: cur.execute("INSERT INTO games (home_team,away_team,game_time,home_score,away_score,status,source,is_anomaly) VALUES (%s,%s,%s,%s,%s,%s,%s,false)",(r.home_team,r.away_team,r.game_time,r.home_score,r.away_score,r.status,r.source))
         saved+=1
-    conn.commit(); cur.close(); conn.close(); return {"status":"ok","saved":saved}
+    conn.commit(); cur.close(); conn.close(); return {"status":"ok","saved":saved,"rejected_as_anomaly":rejected}
 
 @app.post("/news-signal")
 def create_news_signal(signal: NewsSignal):
-    out=exec_sql("INSERT INTO news_signals (league,team,player,signal_type,signal_text,impact_score,source) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",(signal.league,signal.team,signal.player,signal.signal_type,signal.signal_text,signal.impact_score,signal.source)); return {"status":"saved","id":out[0]}
+    impact = signal.impact_score or 0
+    if impact < -10 or impact > 10:
+        exec_sql("INSERT INTO data_anomalies (anomaly_type, source, home_team, away_team, payload, reason, severity) VALUES (%s,%s,%s,%s,%s,%s,%s)", ("news_signal", signal.source, signal.team, None, str(signal.model_dump()), "impact_score outside -10 to 10", "medium"))
+        impact = max(-10, min(10, impact))
+    out=exec_sql("INSERT INTO news_signals (league,team,player,signal_type,signal_text,impact_score,source) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",(signal.league,signal.team,signal.player,signal.signal_type,signal.signal_text,impact,signal.source)); return {"status":"saved","id":out[0]}
+
+@app.get("/anomalies")
+def get_anomalies():
+    data=rows("SELECT id,anomaly_type,source,home_team,away_team,reason,severity,created_at FROM data_anomalies ORDER BY id DESC LIMIT 100")
+    return [{"id":r[0],"anomaly_type":r[1],"source":r[2],"home_team":r[3],"away_team":r[4],"reason":r[5],"severity":r[6],"created_at":str(r[7]) if r[7] else None} for r in data]
 
 @app.get("/news-signals")
 def get_news_signals():
@@ -185,8 +309,8 @@ def get_news_signals():
 
 @app.get("/games")
 def get_games():
-    data=rows("SELECT id,home_team,away_team,game_time,home_odds,away_odds,status,home_score,away_score FROM games ORDER BY id DESC LIMIT 100")
-    return [{"id":r[0],"home_team":r[1],"away_team":r[2],"game_time":str(r[3]) if r[3] else None,"home_odds":float(r[4]) if r[4] is not None else None,"away_odds":float(r[5]) if r[5] is not None else None,"status":r[6],"home_score":r[7],"away_score":r[8]} for r in data]
+    data=rows("SELECT id,home_team,away_team,game_time,home_odds,away_odds,status,home_score,away_score,is_anomaly,anomaly_reason FROM games ORDER BY id DESC LIMIT 100")
+    return [{"id":r[0],"home_team":r[1],"away_team":r[2],"game_time":str(r[3]) if r[3] else None,"home_odds":float(r[4]) if r[4] is not None else None,"away_odds":float(r[5]) if r[5] is not None else None,"status":r[6],"home_score":r[7],"away_score":r[8],"is_anomaly":r[9],"anomaly_reason":r[10]} for r in data]
 
 @app.get("/predictions")
 def get_predictions():
