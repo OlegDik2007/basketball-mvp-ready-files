@@ -34,6 +34,10 @@ def clamp(value, min_value=0.01, max_value=0.99):
     return max(min_value, min(max_value, value))
 
 
+def clamp_score(value, min_value=1, max_value=100):
+    return int(max(min_value, min(max_value, round(value))))
+
+
 def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram not configured. Skipping alert.", flush=True)
@@ -107,6 +111,7 @@ def ensure_money_tables(cur):
             model_probability NUMERIC,
             fair_probability NUMERIC,
             edge NUMERIC,
+            confidence_score INT DEFAULT 50,
             bankroll NUMERIC,
             stake_pct NUMERIC,
             stake_amount NUMERIC,
@@ -121,6 +126,7 @@ def ensure_money_tables(cur):
         )
     """)
     for sql in [
+        "ALTER TABLE bet_recommendations ADD COLUMN IF NOT EXISTS confidence_score INT DEFAULT 50",
         "ALTER TABLE bet_recommendations ADD COLUMN IF NOT EXISTS signal_level TEXT DEFAULT 'PASS'",
         "ALTER TABLE bet_recommendations ADD COLUMN IF NOT EXISTS risk_level TEXT DEFAULT 'HIGH'",
         "ALTER TABLE bet_recommendations ADD COLUMN IF NOT EXISTS reason TEXT",
@@ -160,6 +166,47 @@ def odds_bucket(odds):
     return "HIGH_ODDS_2.21_2.75"
 
 
+def calculate_confidence_score(signal_level, edge, odds, model_probability, fair_probability, home_signal_adj, away_signal_adj, odds_adj, signal_adj):
+    """
+    Confidence score 1-100.
+    This is NOT a guarantee. It is a decision-support score that combines:
+    - edge strength
+    - signal level
+    - odds quality
+    - model vs market gap
+    - OpenClaw signal clarity
+    - auto-learning penalties
+    """
+    score = 50
+
+    score += min(max((edge - MIN_EDGE) * 450, 0), 22)
+    score += min(max((model_probability - fair_probability) * 220, 0), 18)
+
+    if signal_level == "STRONG BET":
+        score += 14
+    elif signal_level == "MEDIUM BET":
+        score += 6
+    else:
+        score -= 20
+
+    odds = float(odds)
+    if 1.75 <= odds <= 2.25:
+        score += 10
+    elif 1.65 <= odds <= 2.75:
+        score += 4
+    else:
+        score -= 20
+
+    signal_gap = abs(home_signal_adj - away_signal_adj)
+    score += min(signal_gap * 250, 10)
+
+    total_penalty = odds_adj.get("probability_penalty", 0) + signal_adj.get("probability_penalty", 0)
+    total_penalty += odds_adj.get("edge_penalty", 0) + signal_adj.get("edge_penalty", 0)
+    score -= total_penalty * 500
+
+    return clamp_score(score)
+
+
 def load_adjustments(cur):
     cur.execute("SELECT bucket_type, bucket_name, probability_penalty, edge_penalty, reason FROM model_adjustments")
     adjustments = {}
@@ -177,11 +224,6 @@ def get_adjustment(adjustments, bucket_type, bucket_name):
 
 
 def rebuild_model_adjustments(cur):
-    """
-    Learns from previous graded recommendations.
-    If a bucket has enough history and poor performance, future signals are penalized.
-    This does NOT place bets; it only makes recommendations stricter.
-    """
     analysis_sql = """
         WITH graded AS (
             SELECT
@@ -284,20 +326,21 @@ def mark_alerted(cur, game_id, recommendation, edge, stake_amount):
     """, (game_id, recommendation, edge, stake_amount))
 
 
-def save_bet_recommendation(cur, game_id, selected_team, recommendation, selected_odds, model_probability, fair_probability, edge, bankroll, stake_pct, stake_amount, signal_level, risk_level, reason):
+def save_bet_recommendation(cur, game_id, selected_team, recommendation, selected_odds, model_probability, fair_probability, edge, confidence_score, bankroll, stake_pct, stake_amount, signal_level, risk_level, reason):
     cur.execute("""
         INSERT INTO bet_recommendations (
             game_id, selected_team, recommendation, selected_odds, model_probability,
-            fair_probability, edge, bankroll, stake_pct, stake_amount,
+            fair_probability, edge, confidence_score, bankroll, stake_pct, stake_amount,
             signal_level, risk_level, reason
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (game_id, recommendation)
         DO UPDATE SET
             selected_odds=EXCLUDED.selected_odds,
             model_probability=EXCLUDED.model_probability,
             fair_probability=EXCLUDED.fair_probability,
             edge=EXCLUDED.edge,
+            confidence_score=EXCLUDED.confidence_score,
             bankroll=EXCLUDED.bankroll,
             stake_pct=EXCLUDED.stake_pct,
             stake_amount=EXCLUDED.stake_amount,
@@ -307,7 +350,7 @@ def save_bet_recommendation(cur, game_id, selected_team, recommendation, selecte
             created_at=NOW()
     """, (
         game_id, selected_team, recommendation, selected_odds, round(model_probability, 4),
-        round(fair_probability, 4), round(edge, 4), round(bankroll, 2),
+        round(fair_probability, 4), round(edge, 4), confidence_score, round(bankroll, 2),
         round(stake_pct, 4), round(stake_amount, 2), signal_level, risk_level, reason
     ))
 
@@ -334,7 +377,9 @@ def run_predictions():
     cur.execute("""
         SELECT id, home_team, away_team, home_odds, away_odds
         FROM games
-        WHERE home_odds IS NOT NULL AND away_odds IS NOT NULL
+        WHERE home_odds IS NOT NULL
+        AND away_odds IS NOT NULL
+        AND COALESCE(is_anomaly, false) = false
     """)
     rows = cur.fetchall()
 
@@ -382,11 +427,22 @@ def run_predictions():
             if signal_level != "PASS":
                 rec = f"{signal_level}: {selected_team} moneyline"
                 stake_pct, stake_amount = calculate_kelly_stake(selected_odds, model_team_prob, bankroll, max_stake_pct, kelly_fraction)
+                confidence_score = calculate_confidence_score(
+                    signal_level,
+                    alert_edge,
+                    float(selected_odds),
+                    model_team_prob,
+                    fair_team_prob,
+                    home_signal_adj,
+                    away_signal_adj,
+                    odds_adj,
+                    signal_adj,
+                )
                 learn_note = ""
                 if odds_adj["reason"] or signal_adj["reason"]:
                     learn_note = f" Auto-learning: {odds_adj['reason']} {signal_adj['reason']}"
-                reason = f"{reason} Model {round(model_team_prob*100,1)}% vs market {round(fair_team_prob*100,1)}%. Adjusted edge {round(alert_edge*100,1)}%. Odds bucket {bucket}.{learn_note}"
-                save_bet_recommendation(cur, game_id, selected_team, rec, float(selected_odds), model_team_prob, fair_team_prob, alert_edge, bankroll, stake_pct, stake_amount, signal_level, risk_level, reason)
+                reason = f"{reason} Confidence {confidence_score}/100. Model {round(model_team_prob*100,1)}% vs market {round(fair_team_prob*100,1)}%. Adjusted edge {round(alert_edge*100,1)}%. Odds bucket {bucket}.{learn_note}"
+                save_bet_recommendation(cur, game_id, selected_team, rec, float(selected_odds), model_team_prob, fair_team_prob, alert_edge, confidence_score, bankroll, stake_pct, stake_amount, signal_level, risk_level, reason)
 
                 if stake_amount > 0 and not already_alerted(cur, game_id, rec):
                     message = f"""
@@ -395,6 +451,7 @@ def run_predictions():
 <b>{away}</b> @ <b>{home}</b>
 Pick: <b>{selected_team} moneyline</b>
 Odds: <b>{selected_odds}</b>
+Confidence: <b>{confidence_score}/100</b>
 Risk: <b>{risk_level}</b>
 
 Model after learning: <b>{round(model_team_prob * 100, 1)}%</b>
