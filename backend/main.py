@@ -2,6 +2,7 @@ import os
 import psycopg2
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Optional
@@ -27,6 +28,7 @@ def db():
 def root():
     return {
         "message": "Basketball Betting Analytics API",
+        "dashboard": "/dashboard",
         "endpoints": [
             "/health",
             "/games",
@@ -35,6 +37,231 @@ def root():
             "/news-signals"
         ]
     }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Basketball Betting Analytics</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+    header {
+      padding: 24px;
+      background: linear-gradient(135deg, #1e3a8a, #111827);
+      border-bottom: 1px solid #334155;
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    .sub { color: #cbd5e1; }
+    .wrap { padding: 24px; max-width: 1200px; margin: 0 auto; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 10px 24px rgba(0,0,0,.25);
+    }
+    .metric { font-size: 30px; font-weight: 700; margin-top: 6px; }
+    .label { color: #94a3b8; font-size: 13px; }
+    .section-title { margin: 28px 0 12px; font-size: 20px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 14px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 12px;
+      border-bottom: 1px solid #1f2937;
+      text-align: left;
+      font-size: 14px;
+    }
+    th { color: #cbd5e1; background: #1f2937; }
+    .bet { color: #22c55e; font-weight: 700; }
+    .no { color: #94a3b8; }
+    .negative { color: #f87171; }
+    .positive { color: #22c55e; }
+    .btn {
+      display: inline-block;
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid #475569;
+      color: white;
+      background: #1d4ed8;
+      cursor: pointer;
+      margin-top: 14px;
+    }
+    .small { color: #94a3b8; font-size: 12px; }
+    @media (max-width: 700px) {
+      table { display: block; overflow-x: auto; white-space: nowrap; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🏀 Basketball Betting Analytics</h1>
+    <div class="sub">Odds + OpenClaw signals + prediction engine</div>
+  </header>
+
+  <div class="wrap">
+    <button class="btn" onclick="loadData()">Refresh Dashboard</button>
+    <div class="small" id="updated">Loading...</div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">Games</div>
+        <div class="metric" id="gamesCount">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Predictions</div>
+        <div class="metric" id="predictionsCount">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Value Bets</div>
+        <div class="metric" id="valueCount">0</div>
+      </div>
+      <div class="card">
+        <div class="label">OpenClaw Signals</div>
+        <div class="metric" id="signalsCount">0</div>
+      </div>
+    </div>
+
+    <h2 class="section-title">🔥 Value Bets</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Game</th>
+          <th>Odds</th>
+          <th>Home Win %</th>
+          <th>Edge</th>
+          <th>Recommendation</th>
+        </tr>
+      </thead>
+      <tbody id="valueBetsTable"></tbody>
+    </table>
+
+    <h2 class="section-title">📊 Latest Predictions</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Game</th>
+          <th>Home Odds</th>
+          <th>Away Odds</th>
+          <th>Home Win %</th>
+          <th>Away Win %</th>
+          <th>Edge</th>
+          <th>Recommendation</th>
+        </tr>
+      </thead>
+      <tbody id="predictionsTable"></tbody>
+    </table>
+
+    <h2 class="section-title">🧠 OpenClaw News Signals</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Team</th>
+          <th>Player</th>
+          <th>Type</th>
+          <th>Signal</th>
+          <th>Impact</th>
+        </tr>
+      </thead>
+      <tbody id="signalsTable"></tbody>
+    </table>
+  </div>
+
+<script>
+function pct(x) {
+  if (x === null || x === undefined) return '-';
+  return (x * 100).toFixed(1) + '%';
+}
+function edge(x) {
+  if (x === null || x === undefined) return '-';
+  return (x * 100).toFixed(1) + '%';
+}
+function clsImpact(x) {
+  return Number(x) < 0 ? 'negative' : 'positive';
+}
+async function fetchJson(path) {
+  const res = await fetch(path);
+  if (!res.ok) throw new Error(path + ' failed');
+  return await res.json();
+}
+async function loadData() {
+  try {
+    const [games, predictions, valueBets, signals] = await Promise.all([
+      fetchJson('/games'),
+      fetchJson('/predictions'),
+      fetchJson('/value-bets'),
+      fetchJson('/news-signals')
+    ]);
+
+    document.getElementById('gamesCount').textContent = games.length;
+    document.getElementById('predictionsCount').textContent = predictions.length;
+    document.getElementById('valueCount').textContent = valueBets.length;
+    document.getElementById('signalsCount').textContent = signals.length;
+    document.getElementById('updated').textContent = 'Updated: ' + new Date().toLocaleString();
+
+    document.getElementById('valueBetsTable').innerHTML = valueBets.length ? valueBets.map(p => `
+      <tr>
+        <td>${p.away_team || '-'} @ ${p.home_team || '-'}</td>
+        <td>${p.home_odds || '-'} / ${p.away_odds || '-'}</td>
+        <td>${pct(p.win_prob_home)}</td>
+        <td class="${Number(p.edge_home) >= 0 ? 'positive' : 'negative'}">${edge(p.edge_home)}</td>
+        <td class="bet">${p.recommendation}</td>
+      </tr>
+    `).join('') : '<tr><td colspan="5" class="no">No value bets right now</td></tr>';
+
+    document.getElementById('predictionsTable').innerHTML = predictions.map(p => `
+      <tr>
+        <td>${p.away_team || '-'} @ ${p.home_team || '-'}</td>
+        <td>${p.home_odds || '-'}</td>
+        <td>${p.away_odds || '-'}</td>
+        <td>${pct(p.win_prob_home)}</td>
+        <td>${pct(p.win_prob_away)}</td>
+        <td class="${Number(p.edge_home) >= 0 ? 'positive' : 'negative'}">${edge(p.edge_home)}</td>
+        <td class="${p.recommendation && p.recommendation !== 'NO BET' ? 'bet' : 'no'}">${p.recommendation || '-'}</td>
+      </tr>
+    `).join('');
+
+    document.getElementById('signalsTable').innerHTML = signals.map(s => `
+      <tr>
+        <td>${s.team || '-'}</td>
+        <td>${s.player || '-'}</td>
+        <td>${s.signal_type || '-'}</td>
+        <td>${s.signal_text || '-'}</td>
+        <td class="${clsImpact(s.impact_score)}">${s.impact_score}</td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    document.getElementById('updated').textContent = 'Error: ' + e.message;
+  }
+}
+loadData();
+setInterval(loadData, 30000);
+</script>
+</body>
+</html>
+    """
 
 
 @app.get("/health")
