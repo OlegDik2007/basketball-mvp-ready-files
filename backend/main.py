@@ -8,8 +8,8 @@ from pydantic import BaseModel
 from typing import Optional, List
 
 load_dotenv()
-app = FastAPI(title="Basketball Betting Analytics MVP")
 
+app = FastAPI(title="Basketball Betting Analytics MVP")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -20,13 +20,21 @@ def db():
 def ensure_core_tables(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS games (
-            id SERIAL PRIMARY KEY, home_team TEXT, away_team TEXT, game_time TIMESTAMP,
-            home_odds NUMERIC, away_odds NUMERIC, status TEXT DEFAULT 'scheduled',
-            home_score INT, away_score INT, source TEXT DEFAULT 'openclaw',
-            created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+            id SERIAL PRIMARY KEY,
+            home_team TEXT,
+            away_team TEXT,
+            game_time TIMESTAMP,
+            home_odds NUMERIC,
+            away_odds NUMERIC,
+            status TEXT DEFAULT 'scheduled',
+            home_score INT,
+            away_score INT,
+            source TEXT DEFAULT 'openclaw',
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
         )
     """)
-    for q in [
+    for sql in [
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'scheduled'",
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS home_score INT",
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS away_score INT",
@@ -34,19 +42,31 @@ def ensure_core_tables(cur):
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
         "ALTER TABLE games ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()",
     ]:
-        cur.execute(q)
+        cur.execute(sql)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
-            id SERIAL PRIMARY KEY, game_id INT, win_prob_home NUMERIC,
-            win_prob_away NUMERIC, edge_home NUMERIC, recommendation TEXT,
+            id SERIAL PRIMARY KEY,
+            game_id INT,
+            win_prob_home NUMERIC,
+            win_prob_away NUMERIC,
+            edge_home NUMERIC,
+            recommendation TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         )
     """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS news_signals (
-            id SERIAL PRIMARY KEY, league TEXT DEFAULT 'NBA', team TEXT, player TEXT,
-            signal_type TEXT, signal_text TEXT, impact_score NUMERIC,
-            source TEXT DEFAULT 'openclaw', created_at TIMESTAMP DEFAULT NOW()
+            id SERIAL PRIMARY KEY,
+            league TEXT DEFAULT 'NBA',
+            team TEXT,
+            player TEXT,
+            signal_type TEXT,
+            signal_text TEXT,
+            impact_score NUMERIC,
+            source TEXT DEFAULT 'openclaw',
+            created_at TIMESTAMP DEFAULT NOW()
         )
     """)
 
@@ -54,23 +74,35 @@ def ensure_core_tables(cur):
 def ensure_tracking_tables(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bet_recommendations (
-            id SERIAL PRIMARY KEY, game_id INT, selected_team TEXT, recommendation TEXT,
-            selected_odds NUMERIC, model_probability NUMERIC, fair_probability NUMERIC,
-            edge NUMERIC, bankroll NUMERIC, stake_pct NUMERIC, stake_amount NUMERIC,
-            signal_level TEXT DEFAULT 'PASS', risk_level TEXT DEFAULT 'HIGH', reason TEXT,
-            status TEXT DEFAULT 'open', result_profit NUMERIC DEFAULT 0,
-            created_at TIMESTAMP DEFAULT NOW(), settled_at TIMESTAMP,
+            id SERIAL PRIMARY KEY,
+            game_id INT,
+            selected_team TEXT,
+            recommendation TEXT,
+            selected_odds NUMERIC,
+            model_probability NUMERIC,
+            fair_probability NUMERIC,
+            edge NUMERIC,
+            bankroll NUMERIC,
+            stake_pct NUMERIC,
+            stake_amount NUMERIC,
+            signal_level TEXT DEFAULT 'PASS',
+            risk_level TEXT DEFAULT 'HIGH',
+            reason TEXT,
+            status TEXT DEFAULT 'open',
+            result_profit NUMERIC DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW(),
+            settled_at TIMESTAMP,
             UNIQUE (game_id, recommendation)
         )
     """)
-    for q in [
+    for sql in [
         "ALTER TABLE bet_recommendations ADD COLUMN IF NOT EXISTS signal_level TEXT DEFAULT 'PASS'",
         "ALTER TABLE bet_recommendations ADD COLUMN IF NOT EXISTS risk_level TEXT DEFAULT 'HIGH'",
         "ALTER TABLE bet_recommendations ADD COLUMN IF NOT EXISTS reason TEXT",
         "ALTER TABLE bet_recommendations ADD COLUMN IF NOT EXISTS result_profit NUMERIC DEFAULT 0",
         "ALTER TABLE bet_recommendations ADD COLUMN IF NOT EXISTS settled_at TIMESTAMP",
     ]:
-        cur.execute(q)
+        cur.execute(sql)
 
 
 class NewsSignal(BaseModel):
@@ -117,7 +149,14 @@ class BetResult(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "Basketball Betting Analytics API", "dashboard": "/dashboard", "top3": "/top-bets", "openclaw_imports": ["POST /games/import", "POST /results/import", "POST /news-signal"]}
+    return {
+        "message": "Basketball Betting Analytics API",
+        "dashboard": "/dashboard",
+        "top3": "/top-bets",
+        "accuracy": "/accuracy",
+        "audit": "/audit",
+        "openclaw_imports": ["POST /games/import", "POST /results/import", "POST /news-signal"]
+    }
 
 
 @app.get("/health")
@@ -128,18 +167,32 @@ def health():
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
-<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'><title>Basketball Analytics Dashboard</title>
-<style>body{margin:0;font-family:Arial;background:#0f172a;color:#e5e7eb}header{padding:24px;background:#111827;border-bottom:1px solid #334155}.wrap{padding:24px;max-width:1250px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:20px 0}.card{background:#111827;border:1px solid #334155;border-radius:16px;padding:16px}.label{color:#94a3b8;font-size:13px}.metric{font-size:28px;font-weight:700;margin-top:6px}.pos{color:#22c55e}.neg{color:#f87171}.no{color:#94a3b8}.bet{color:#22c55e;font-weight:700}.strong{color:#22c55e;font-weight:800}.medium{color:#facc15;font-weight:800}table{width:100%;border-collapse:collapse;background:#111827;border:1px solid #334155;border-radius:14px;overflow:hidden;margin-bottom:26px}th,td{padding:10px;border-bottom:1px solid #1f2937;text-align:left;font-size:14px}th{background:#1f2937;color:#cbd5e1}.btn{padding:9px 12px;border-radius:10px;border:1px solid #475569;background:#1d4ed8;color:white;cursor:pointer}.mini{font-size:12px;color:#94a3b8}@media(max-width:700px){table{display:block;overflow-x:auto;white-space:nowrap}}</style></head>
-<body><header><h1>🏀 Basketball Betting Analytics</h1><div>Top 3 daily signals only • OpenClaw + Neon + Prediction + Bankroll</div></header><div class='wrap'>
-<button class='btn' onclick='loadData()'>Refresh</button><div class='mini' id='updated'>Loading...</div>
-<div class='grid'><div class='card'><div class='label'>Games</div><div class='metric' id='gamesCount'>0</div></div><div class='card'><div class='label'>Predictions</div><div class='metric' id='predictionsCount'>0</div></div><div class='card'><div class='label'>Top Bets Today</div><div class='metric' id='topCount'>0</div></div><div class='card'><div class='label'>Open Bets</div><div class='metric' id='openBets'>0</div></div><div class='card'><div class='label'>Profit</div><div class='metric' id='profit'>$0</div></div><div class='card'><div class='label'>ROI</div><div class='metric' id='roi'>0%</div></div></div>
-<h2>🏆 Top 3 Bets Today</h2><table><thead><tr><th>Rank</th><th>Game</th><th>Signal</th><th>Pick</th><th>Odds</th><th>Edge</th><th>Stake</th><th>Reason</th></tr></thead><tbody id='topBetsTable'></tbody></table>
-<h2>💰 Bet Tracking</h2><table><thead><tr><th>ID</th><th>Game</th><th>Pick</th><th>Odds</th><th>Edge</th><th>Stake</th><th>Status</th><th>Profit</th><th>Actions</th></tr></thead><tbody id='betsTable'></tbody></table>
-<h2>📊 Latest Predictions</h2><table><thead><tr><th>Game</th><th>Home Odds</th><th>Away Odds</th><th>Home %</th><th>Away %</th><th>Edge</th><th>Recommendation</th></tr></thead><tbody id='predictionsTable'></tbody></table>
-<h2>🧠 Signals</h2><table><thead><tr><th>Team</th><th>Player</th><th>Type</th><th>Signal</th><th>Impact</th></tr></thead><tbody id='signalsTable'></tbody></table>
-</div><script>
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Basketball Analytics Dashboard</title>
+<style>
+body{margin:0;font-family:Arial;background:#0f172a;color:#e5e7eb}header{padding:24px;background:#111827;border-bottom:1px solid #334155}.wrap{padding:24px;max-width:1250px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin:20px 0}.card{background:#111827;border:1px solid #334155;border-radius:16px;padding:16px}.label{color:#94a3b8;font-size:13px}.metric{font-size:28px;font-weight:700;margin-top:6px}.pos{color:#22c55e}.neg{color:#f87171}.no{color:#94a3b8}.bet{color:#22c55e;font-weight:700}.strong{color:#22c55e;font-weight:800}.medium{color:#facc15;font-weight:800}table{width:100%;border-collapse:collapse;background:#111827;border:1px solid #334155;border-radius:14px;overflow:hidden;margin-bottom:26px}th,td{padding:10px;border-bottom:1px solid #1f2937;text-align:left;font-size:14px}th{background:#1f2937;color:#cbd5e1}.btn{padding:9px 12px;border-radius:10px;border:1px solid #475569;background:#1d4ed8;color:white;cursor:pointer}.mini{font-size:12px;color:#94a3b8}@media(max-width:700px){table{display:block;overflow-x:auto;white-space:nowrap}}
+</style></head>
+<body><header><h1>🏀 Basketball Betting Analytics</h1><div>Top 3 daily signals • Audit accuracy • OpenClaw + Neon</div></header>
+<div class="wrap">
+<button class="btn" onclick="loadData()">Refresh</button><div class="mini" id="updated">Loading...</div>
+<div class="grid">
+<div class="card"><div class="label">Games</div><div class="metric" id="gamesCount">0</div></div>
+<div class="card"><div class="label">Top Bets Today</div><div class="metric" id="topCount">0</div></div>
+<div class="card"><div class="label">Accuracy</div><div class="metric" id="accuracy">0%</div></div>
+<div class="card"><div class="label">Correct / Graded</div><div class="metric" id="correctCount">0/0</div></div>
+<div class="card"><div class="label">Profit</div><div class="metric" id="profit">$0</div></div>
+<div class="card"><div class="label">ROI</div><div class="metric" id="roi">0%</div></div>
+</div>
+<h2>🏆 Top 3 Bets Today</h2><table><thead><tr><th>Rank</th><th>Game</th><th>Signal</th><th>Pick</th><th>Odds</th><th>Edge</th><th>Stake</th><th>Reason</th></tr></thead><tbody id="topBetsTable"></tbody></table>
+<h2>✅ Accuracy Audit: picks vs real winner</h2><table><thead><tr><th>ID</th><th>Game</th><th>Pick</th><th>Score</th><th>Actual Winner</th><th>Matched?</th><th>Signal</th><th>Edge</th></tr></thead><tbody id="auditTable"></tbody></table>
+<h2>💰 Bet Tracking</h2><table><thead><tr><th>ID</th><th>Game</th><th>Pick</th><th>Odds</th><th>Edge</th><th>Stake</th><th>Status</th><th>Profit</th><th>Actions</th></tr></thead><tbody id="betsTable"></tbody></table>
+<h2>🧠 Signals</h2><table><thead><tr><th>Team</th><th>Player</th><th>Type</th><th>Signal</th><th>Impact</th></tr></thead><tbody id="signalsTable"></tbody></table>
+</div>
+<script>
 function pct(x){return x==null?'-':(x*100).toFixed(1)+'%'}function money(x){return '$'+Number(x||0).toFixed(2)}function edge(x){return x==null?'-':(x*100).toFixed(1)+'%'}function cls(x){return Number(x)>=0?'pos':'neg'}async function j(p){const r=await fetch(p);if(!r.ok)throw new Error(p);return r.json()}async function settle(id,status){await fetch('/bets/'+id+'/result',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})});loadData()}
-async function loadData(){try{const [games,preds,top,sigs,bets,perf]=await Promise.all([j('/games'),j('/predictions'),j('/top-bets'),j('/news-signals'),j('/bets'),j('/performance')]);document.getElementById('gamesCount').textContent=games.length;document.getElementById('predictionsCount').textContent=preds.length;document.getElementById('topCount').textContent=top.length;document.getElementById('openBets').textContent=perf.open_bets;document.getElementById('profit').textContent=money(perf.profit);document.getElementById('profit').className='metric '+cls(perf.profit);document.getElementById('roi').textContent=Number(perf.roi||0).toFixed(1)+'%';document.getElementById('roi').className='metric '+cls(perf.roi);document.getElementById('updated').textContent='Updated: '+new Date().toLocaleString();document.getElementById('topBetsTable').innerHTML=top.length?top.map((b,i)=>`<tr><td>#${i+1}</td><td>${b.away_team||'-'} @ ${b.home_team||'-'}</td><td class='${b.signal_level==='STRONG BET'?'strong':'medium'}'>${b.signal_level}</td><td>${b.recommendation}</td><td>${b.selected_odds}</td><td class='${cls(b.edge)}'>${edge(b.edge)}</td><td>${money(b.stake_amount)}</td><td>${b.reason||''}</td></tr>`).join(''):'<tr><td colspan=8 class=no>No top bets today</td></tr>';document.getElementById('betsTable').innerHTML=bets.length?bets.map(b=>`<tr><td>${b.id}</td><td>${b.away_team||'-'} @ ${b.home_team||'-'}</td><td class='bet'>${b.recommendation}</td><td>${b.selected_odds}</td><td class='${cls(b.edge)}'>${edge(b.edge)}</td><td>${money(b.stake_amount)}</td><td>${b.status}</td><td class='${cls(b.result_profit)}'>${money(b.result_profit)}</td><td><button onclick="settle(${b.id},'won')">Won</button> <button onclick="settle(${b.id},'lost')">Lost</button> <button onclick="settle(${b.id},'push')">Push</button></td></tr>`).join(''):'<tr><td colspan=9 class=no>No tracked bets yet</td></tr>';document.getElementById('predictionsTable').innerHTML=preds.map(p=>`<tr><td>${p.away_team||'-'} @ ${p.home_team||'-'}</td><td>${p.home_odds||'-'}</td><td>${p.away_odds||'-'}</td><td>${pct(p.win_prob_home)}</td><td>${pct(p.win_prob_away)}</td><td class='${cls(p.edge_home)}'>${edge(p.edge_home)}</td><td class='${p.recommendation!='NO BET'?'bet':'no'}'>${p.recommendation}</td></tr>`).join('');document.getElementById('signalsTable').innerHTML=sigs.map(s=>`<tr><td>${s.team||'-'}</td><td>${s.player||'-'}</td><td>${s.signal_type||'-'}</td><td>${s.signal_text||'-'}</td><td class='${cls(s.impact_score)}'>${s.impact_score}</td></tr>`).join('')}catch(e){document.getElementById('updated').textContent='Error: '+e.message}}loadData();setInterval(loadData,30000);
+async function loadData(){try{const [games,top,sigs,bets,perf,acc,audit]=await Promise.all([j('/games'),j('/top-bets'),j('/news-signals'),j('/bets'),j('/performance'),j('/accuracy'),j('/audit')]);document.getElementById('gamesCount').textContent=games.length;document.getElementById('topCount').textContent=top.length;document.getElementById('profit').textContent=money(perf.profit);document.getElementById('profit').className='metric '+cls(perf.profit);document.getElementById('roi').textContent=Number(perf.roi||0).toFixed(1)+'%';document.getElementById('roi').className='metric '+cls(perf.roi);document.getElementById('accuracy').textContent=Number(acc.accuracy_pct||0).toFixed(1)+'%';document.getElementById('accuracy').className='metric '+cls(acc.accuracy_pct);document.getElementById('correctCount').textContent=`${acc.correct}/${acc.graded}`;document.getElementById('updated').textContent='Updated: '+new Date().toLocaleString();document.getElementById('topBetsTable').innerHTML=top.length?top.map((b,i)=>`<tr><td>#${i+1}</td><td>${b.away_team||'-'} @ ${b.home_team||'-'}</td><td class='${b.signal_level==='STRONG BET'?'strong':'medium'}'>${b.signal_level}</td><td>${b.recommendation}</td><td>${b.selected_odds}</td><td class='${cls(b.edge)}'>${edge(b.edge)}</td><td>${money(b.stake_amount)}</td><td>${b.reason||''}</td></tr>`).join(''):'<tr><td colspan=8 class=no>No top bets today</td></tr>';document.getElementById('auditTable').innerHTML=audit.length?audit.map(a=>`<tr><td>${a.bet_id}</td><td>${a.away_team||'-'} @ ${a.home_team||'-'}</td><td>${a.selected_team}</td><td>${a.away_score??'-'} - ${a.home_score??'-'}</td><td>${a.actual_winner||'-'}</td><td class='${a.is_correct?'pos':'neg'}'>${a.is_correct===null?'Pending':(a.is_correct?'YES':'NO')}</td><td>${a.signal_level||'-'}</td><td>${edge(a.edge)}</td></tr>`).join(''):'<tr><td colspan=8 class=no>No graded picks yet</td></tr>';document.getElementById('betsTable').innerHTML=bets.length?bets.map(b=>`<tr><td>${b.id}</td><td>${b.away_team||'-'} @ ${b.home_team||'-'}</td><td class='bet'>${b.recommendation}</td><td>${b.selected_odds}</td><td class='${cls(b.edge)}'>${edge(b.edge)}</td><td>${money(b.stake_amount)}</td><td>${b.status}</td><td class='${cls(b.result_profit)}'>${money(b.result_profit)}</td><td><button onclick="settle(${b.id},'won')">Won</button> <button onclick="settle(${b.id},'lost')">Lost</button> <button onclick="settle(${b.id},'push')">Push</button></td></tr>`).join(''):'<tr><td colspan=9 class=no>No tracked bets yet</td></tr>';document.getElementById('signalsTable').innerHTML=sigs.map(s=>`<tr><td>${s.team||'-'}</td><td>${s.player||'-'}</td><td>${s.signal_type||'-'}</td><td>${s.signal_text||'-'}</td><td class='${cls(s.impact_score)}'>${s.impact_score}</td></tr>`).join('')}catch(e){document.getElementById('updated').textContent='Error: '+e.message}}
+loadData();setInterval(loadData,30000);
 </script></body></html>
     """
 
@@ -246,6 +299,62 @@ def update_bet_result(bet_id: int, result: BetResult):
     elif status == "lost": profit = -stake
     cur.execute("UPDATE bet_recommendations SET status=%s, result_profit=%s, settled_at=CASE WHEN %s='open' THEN NULL ELSE NOW() END WHERE id=%s", (status, round(profit,2), status, bet_id))
     conn.commit(); cur.close(); conn.close(); return {"status":"updated","bet_id":bet_id,"result":status,"profit":round(profit,2)}
+
+
+@app.get("/audit")
+def audit():
+    conn = db(); cur = conn.cursor(); ensure_tracking_tables(cur); conn.commit()
+    cur.execute("""
+        SELECT
+            b.id, b.game_id, g.home_team, g.away_team, b.selected_team,
+            b.recommendation, b.signal_level, b.edge, b.stake_amount,
+            g.home_score, g.away_score,
+            CASE
+                WHEN g.home_score IS NULL OR g.away_score IS NULL THEN NULL
+                WHEN g.home_score > g.away_score THEN g.home_team
+                WHEN g.away_score > g.home_score THEN g.away_team
+                ELSE 'PUSH'
+            END AS actual_winner,
+            CASE
+                WHEN g.home_score IS NULL OR g.away_score IS NULL THEN NULL
+                WHEN g.home_score = g.away_score THEN NULL
+                WHEN LOWER(b.selected_team) = LOWER(CASE WHEN g.home_score > g.away_score THEN g.home_team ELSE g.away_team END) THEN true
+                ELSE false
+            END AS is_correct,
+            b.created_at
+        FROM bet_recommendations b
+        LEFT JOIN games g ON g.id = b.game_id
+        ORDER BY b.id DESC
+        LIMIT 200
+    """)
+    rows = cur.fetchall(); cur.close(); conn.close()
+    return [{
+        "bet_id": r[0], "game_id": r[1], "home_team": r[2], "away_team": r[3],
+        "selected_team": r[4], "recommendation": r[5], "signal_level": r[6],
+        "edge": float(r[7]) if r[7] is not None else None,
+        "stake_amount": float(r[8]) if r[8] is not None else 0,
+        "home_score": r[9], "away_score": r[10], "actual_winner": r[11],
+        "is_correct": r[12], "created_at": str(r[13]) if r[13] else None
+    } for r in rows]
+
+
+@app.get("/accuracy")
+def accuracy():
+    conn = db(); cur = conn.cursor(); ensure_tracking_tables(cur); conn.commit()
+    cur.execute("""
+        SELECT
+            COUNT(*) FILTER (WHERE g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score != g.away_score) AS graded,
+            COUNT(*) FILTER (
+                WHERE g.home_score IS NOT NULL AND g.away_score IS NOT NULL AND g.home_score != g.away_score
+                AND LOWER(b.selected_team) = LOWER(CASE WHEN g.home_score > g.away_score THEN g.home_team ELSE g.away_team END)
+            ) AS correct
+        FROM bet_recommendations b
+        LEFT JOIN games g ON g.id = b.game_id
+    """)
+    row = cur.fetchone(); cur.close(); conn.close()
+    graded = int(row[0] or 0); correct = int(row[1] or 0)
+    accuracy_pct = (correct / graded * 100) if graded else 0
+    return {"graded": graded, "correct": correct, "wrong": graded - correct, "accuracy_pct": round(accuracy_pct, 2)}
 
 
 @app.get("/performance")
