@@ -1,9 +1,12 @@
 import os
 import psycopg2
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 def db():
@@ -21,6 +24,59 @@ def implied_probability(decimal_odds):
 
 def clamp(value, min_value=0.01, max_value=0.99):
     return max(min_value, min(max_value, value))
+
+
+def send_telegram_alert(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured. Skipping alert.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        response = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }, timeout=15)
+
+        if response.status_code != 200:
+            print("Telegram error:", response.status_code, response.text)
+            return False
+
+        return True
+    except Exception as e:
+        print("Telegram request failed:", e)
+        return False
+
+
+def ensure_alert_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS value_bet_alerts (
+            id SERIAL PRIMARY KEY,
+            game_id INT,
+            recommendation TEXT,
+            edge NUMERIC,
+            sent_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (game_id, recommendation)
+        )
+    """)
+
+
+def already_alerted(cur, game_id, recommendation):
+    cur.execute("""
+        SELECT id FROM value_bet_alerts
+        WHERE game_id = %s AND recommendation = %s
+        LIMIT 1
+    """, (game_id, recommendation))
+    return cur.fetchone() is not None
+
+
+def mark_alerted(cur, game_id, recommendation, edge):
+    cur.execute("""
+        INSERT INTO value_bet_alerts (game_id, recommendation, edge)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (game_id, recommendation) DO NOTHING
+    """, (game_id, recommendation, edge))
 
 
 def get_team_signal_impact(cur, team_name):
@@ -48,6 +104,7 @@ def get_team_signal_impact(cur, team_name):
 def run_predictions():
     conn = db()
     cur = conn.cursor()
+    ensure_alert_table(cur)
 
     cur.execute("""
         SELECT id, home_team, away_team, home_odds, away_odds
@@ -83,10 +140,23 @@ def run_predictions():
         edge_away = a_prob - fair_away
 
         rec = "NO BET"
+        alert_edge = edge_home
+        model_team_prob = h_prob
+        selected_team = home
+        selected_odds = h_odds
+
         if edge_home >= 0.05:
             rec = f"BET {home} moneyline"
+            alert_edge = edge_home
+            model_team_prob = h_prob
+            selected_team = home
+            selected_odds = h_odds
         elif edge_away >= 0.05:
             rec = f"BET {away} moneyline"
+            alert_edge = edge_away
+            model_team_prob = a_prob
+            selected_team = away
+            selected_odds = a_odds
 
         cur.execute("""
             INSERT INTO predictions (
@@ -104,6 +174,27 @@ def run_predictions():
             round(edge_home, 4),
             rec
         ))
+
+        if rec != "NO BET" and not already_alerted(cur, game_id, rec):
+            message = f"""
+🏀 <b>Value Bet Alert</b>
+
+<b>{away}</b> @ <b>{home}</b>
+
+Recommendation: <b>{rec}</b>
+Selected team: <b>{selected_team}</b>
+Odds: <b>{selected_odds}</b>
+
+Model probability: <b>{round(model_team_prob * 100, 1)}%</b>
+Edge: <b>{round(alert_edge * 100, 1)}%</b>
+
+Home signal adjustment: {round(home_signal_adj * 100, 1)}%
+Away signal adjustment: {round(away_signal_adj * 100, 1)}%
+
+⚠️ This is an analytics signal, not a guarantee.
+"""
+            if send_telegram_alert(message):
+                mark_alerted(cur, game_id, rec, round(alert_edge, 4))
 
     conn.commit()
     cur.close()
