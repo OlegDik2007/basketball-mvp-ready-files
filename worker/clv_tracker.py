@@ -11,6 +11,10 @@ def db():
 
 
 def ensure_clv_tables(cur):
+    # Make this safe for older Neon tables too
+    cur.execute("ALTER TABLE games ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'openclaw'")
+    cur.execute("ALTER TABLE games ADD COLUMN IF NOT EXISTS is_anomaly BOOLEAN DEFAULT false")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS odds_snapshots (
             id SERIAL PRIMARY KEY,
@@ -45,9 +49,10 @@ def snapshot_current_odds(snapshot_type="update"):
     conn = db()
     cur = conn.cursor()
     ensure_clv_tables(cur)
+    conn.commit()
 
     cur.execute("""
-        SELECT id, home_team, away_team, home_odds, away_odds, source
+        SELECT id, home_team, away_team, home_odds, away_odds, COALESCE(source, 'openclaw')
         FROM games
         WHERE home_odds IS NOT NULL
           AND away_odds IS NOT NULL
@@ -70,17 +75,14 @@ def snapshot_current_odds(snapshot_type="update"):
     cur.close()
     conn.close()
 
-    print(f"✅ Saved {saved} odds snapshots as {snapshot_type}")
+    print(f"✅ Saved {saved} odds snapshots as {snapshot_type}", flush=True)
 
 
 def calculate_clv():
-    """
-    CLV = selected_odds / closing_odds - 1
-    Positive CLV means you got a better price than closing market.
-    """
     conn = db()
     cur = conn.cursor()
     ensure_clv_tables(cur)
+    conn.commit()
 
     cur.execute("""
         SELECT
@@ -164,7 +166,7 @@ def calculate_clv():
     cur.close()
     conn.close()
 
-    print(f"✅ Calculated CLV for {calculated} bets")
+    print(f"✅ Calculated CLV for {calculated} bets", flush=True)
 
 
 if __name__ == "__main__":
