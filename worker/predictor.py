@@ -496,3 +496,6 @@ Reason: {reason}
     cur.close()
     conn.close()
     print(f"Predictions done for {len(rows)} games", flush=True)
+
+if __name__ == "__main__":
+    run_predictions()
